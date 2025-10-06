@@ -27,11 +27,7 @@
 #include <ArduinoJson.h>
 #include <Update.h>
 
-// ESP-IDF headers to fetch station MAC/IP info while in softAP mode
-extern "C" {
-  #include "esp_wifi.h"
-  #include "esp_netif.h"
-}
+// Note: Avoid IDF-specific netif/tcpip headers for Arduino portability
 
 // ---------- CONFIG ----------
 const char* AP_SSID = "Free WiFi Gateway ";  //  simplified AP
@@ -189,40 +185,7 @@ String ipToString(IPAddress ip) {
   return String(ip[0]) + "." + String(ip[1]) + "." + String(ip[2]) + "." + String(ip[3]);
 }
 
-String getClientMAC() {
-  return WiFi.macAddress();
-}
-
-// Return the MAC address (as AA:BB:CC:DD:EE:FF) of the station currently
-// associated to the softAP and matching the provided IP (string form).
-// Returns empty string if not found.
-String getClientMacByIP(const String &ipStr) {
-  IPAddress targetIP;
-  if (!targetIP.fromString(ipStr)) {
-    return "";
-  }
-
-  wifi_sta_list_t wifiStaList;
-  esp_netif_sta_list_t netifStaList;
-  if (esp_wifi_ap_get_sta_list(&wifiStaList) != ESP_OK) {
-    return "";
-  }
-  if (esp_netif_get_sta_list(&wifiStaList, &netifStaList) != ESP_OK) {
-    return "";
-  }
-
-  for (int i = 0; i < netifStaList.num; i++) {
-    const auto &sta = netifStaList.sta[i];
-    IPAddress staIP(sta.ip.addr);
-    if (staIP == targetIP) {
-      char macBuf[18];
-      snprintf(macBuf, sizeof(macBuf), "%02X:%02X:%02X:%02X:%02X:%02X",
-               sta.mac[0], sta.mac[1], sta.mac[2], sta.mac[3], sta.mac[4], sta.mac[5]);
-      return String(macBuf);
-    }
-  }
-  return "";
-}
+String getClientMAC() { return WiFi.macAddress(); }
 
 String formatDataUsage(unsigned long bytes) {
   if (bytes < 1024) return String(bytes) + " B";
@@ -509,11 +472,8 @@ void grantAccessWithDuration(const String &ip, unsigned long durationMs, const S
   }
   
   sessions[idx].ip = ip;
-  // Store the actual client's MAC (not the ESP32's own MAC)
-  {
-    String mac = getClientMacByIP(ip);
-    sessions[idx].mac = mac.length() ? mac : String("Unknown");
-  }
+  // Store the ESP's MAC as placeholder (Arduino core does not expose per-station MAC by IP)
+  sessions[idx].mac = getClientMAC();
   sessions[idx].hostname = "Client-" + String(random(1000, 9999));
   sessions[idx].grantTime = millis();
   sessions[idx].expireAt = millis() + durationMs;
@@ -1921,8 +1881,7 @@ void handleRoot() {
 
   bool allowed = isWhitelisted(clientIP);
   if (!allowed) {
-    String mac = getClientMacByIP(clientIP);
-    if (mac.length()) allowed = isMacGranted(mac);
+    allowed = isMacGranted(getClientMAC());
   }
 
   if(allowed) {
@@ -1956,10 +1915,7 @@ void handleGrantTask() {
       grantAccessWithDuration(clientIP, availableTasks[i].rewardDuration, availableTasks[i].name);
 
       // ✅ Instantly unlock the device and close the captive portal
-      {
-        String clientMac = getClientMacByIP(clientIP);
-        unlockClientAndRedirect(clientIP, clientMac);
-      }
+      unlockClientAndRedirect(clientIP, getClientMAC());
 
       // Update stats
       if (availableTasks[i].type == "youtube") stats.youtubeTasks++;
@@ -2108,8 +2064,7 @@ void handleNotFound() {
   // If IP has an active session, or MAC is granted, do not force captive portal
   bool allowed = isWhitelisted(clientIP);
   if (!allowed) {
-    String mac = getClientMacByIP(clientIP);
-    if (mac.length()) allowed = isMacGranted(mac);
+    allowed = isMacGranted(getClientMAC());
   }
 
   if (allowed) {
@@ -2382,10 +2337,7 @@ void setupCaptiveHandlers() {
     // If the client is allowed, respond 204 so the OS closes the captive UI
     String ip = getClientIPString();
     bool allowed = isWhitelisted(ip);
-    if (!allowed) {
-      String mac = getClientMacByIP(ip);
-      if (mac.length()) allowed = isMacGranted(mac);
-    }
+    if (!allowed) allowed = isMacGranted(getClientMAC());
     if (allowed) server.send(204, "text/plain", "");
     else server.send(200, "text/html", WELCOME_HTML);
   });
@@ -2393,10 +2345,7 @@ void setupCaptiveHandlers() {
   server.on("/connecttest.txt", [](){
     String ip = getClientIPString();
     bool allowed = isWhitelisted(ip);
-    if (!allowed) {
-      String mac = getClientMacByIP(ip);
-      if (mac.length()) allowed = isMacGranted(mac);
-    }
+    if (!allowed) allowed = isMacGranted(getClientMAC());
     if (allowed) server.send(200, "text/plain", "OK");
     else server.send(200, "text/html", WELCOME_HTML);
   });
@@ -2404,10 +2353,7 @@ void setupCaptiveHandlers() {
   server.on("/hotspot-detect.html", [](){
     String ip = getClientIPString();
     bool allowed = isWhitelisted(ip);
-    if (!allowed) {
-      String mac = getClientMacByIP(ip);
-      if (mac.length()) allowed = isMacGranted(mac);
-    }
+    if (!allowed) allowed = isMacGranted(getClientMAC());
     if (allowed) server.send(200, "text/html", "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>");
     else server.send(200, "text/html", WELCOME_HTML);
   });
@@ -2415,10 +2361,7 @@ void setupCaptiveHandlers() {
   server.on("/ncsi.txt", [](){
     String ip = getClientIPString();
     bool allowed = isWhitelisted(ip);
-    if (!allowed) {
-      String mac = getClientMacByIP(ip);
-      if (mac.length()) allowed = isMacGranted(mac);
-    }
+    if (!allowed) allowed = isMacGranted(getClientMAC());
     if (allowed) server.send(200, "text/plain", "Microsoft NCSI");
     else server.send(200, "text/html", WELCOME_HTML);
   });
@@ -2426,10 +2369,7 @@ void setupCaptiveHandlers() {
   server.on("/success.txt", [](){
     String ip = getClientIPString();
     bool allowed = isWhitelisted(ip);
-    if (!allowed) {
-      String mac = getClientMacByIP(ip);
-      if (mac.length()) allowed = isMacGranted(mac);
-    }
+    if (!allowed) allowed = isMacGranted(getClientMAC());
     if (allowed) server.send(200, "text/plain", "Success");
     else server.send(200, "text/html", WELCOME_HTML);
   });
