@@ -27,6 +27,12 @@
 #include <ArduinoJson.h>
 #include <Update.h>
 
+// ESP-IDF headers to fetch station MAC/IP info while in softAP mode
+extern "C" {
+  #include "esp_wifi.h"
+  #include "tcpip_adapter.h"
+}
+
 // ---------- CONFIG ----------
 const char* AP_SSID = "Free WiFi Gateway ";  //  simplified AP
 const char* AP_PASSWORD = "";    // open network (leave empty for open).
@@ -185,6 +191,37 @@ String ipToString(IPAddress ip) {
 
 String getClientMAC() {
   return WiFi.macAddress();
+}
+
+// Return the MAC address (as AA:BB:CC:DD:EE:FF) of the station currently
+// associated to the softAP and matching the provided IP (string form).
+// Returns empty string if not found.
+String getClientMacByIP(const String &ipStr) {
+  IPAddress targetIP;
+  if (!targetIP.fromString(ipStr)) {
+    return "";
+  }
+
+  wifi_sta_list_t wifiStaList;
+  tcpip_adapter_sta_list_t adapterStaList;
+  if (esp_wifi_ap_get_sta_list(&wifiStaList) != ESP_OK) {
+    return "";
+  }
+  if (tcpip_adapter_get_sta_list(&wifiStaList, &adapterStaList) != ESP_OK) {
+    return "";
+  }
+
+  for (int i = 0; i < adapterStaList.num; i++) {
+    const auto &sta = adapterStaList.sta[i];
+    IPAddress staIP(sta.ip.addr);
+    if (staIP == targetIP) {
+      char macBuf[18];
+      snprintf(macBuf, sizeof(macBuf), "%02X:%02X:%02X:%02X:%02X:%02X",
+               sta.mac[0], sta.mac[1], sta.mac[2], sta.mac[3], sta.mac[4], sta.mac[5]);
+      return String(macBuf);
+    }
+  }
+  return "";
 }
 
 String formatDataUsage(unsigned long bytes) {
@@ -472,7 +509,11 @@ void grantAccessWithDuration(const String &ip, unsigned long durationMs, const S
   }
   
   sessions[idx].ip = ip;
-  sessions[idx].mac = getClientMAC();
+  // Store the actual client's MAC (not the ESP32's own MAC)
+  {
+    String mac = getClientMacByIP(ip);
+    sessions[idx].mac = mac.length() ? mac : String("Unknown");
+  }
   sessions[idx].hostname = "Client-" + String(random(1000, 9999));
   sessions[idx].grantTime = millis();
   sessions[idx].expireAt = millis() + durationMs;
@@ -1877,8 +1918,14 @@ String makeGrantedPage() {
 void handleRoot() {
   String clientIP = getClientIPString();
   logInfo("Root request from IP: " + clientIP);
-  
-  if(isWhitelisted(clientIP)) {
+
+  bool allowed = isWhitelisted(clientIP);
+  if (!allowed) {
+    String mac = getClientMacByIP(clientIP);
+    if (mac.length()) allowed = isMacGranted(mac);
+  }
+
+  if(allowed) {
     server.send(200, "text/html", makeGrantedPage());
   } else {
     server.send(200, "text/html", WELCOME_HTML);
@@ -1909,7 +1956,10 @@ void handleGrantTask() {
       grantAccessWithDuration(clientIP, availableTasks[i].rewardDuration, availableTasks[i].name);
 
       // ✅ Instantly unlock the device and close the captive portal
-      unlockClientAndRedirect(clientIP, "");
+      {
+        String clientMac = getClientMacByIP(clientIP);
+        unlockClientAndRedirect(clientIP, clientMac);
+      }
 
       // Update stats
       if (availableTasks[i].type == "youtube") stats.youtubeTasks++;
@@ -2054,12 +2104,19 @@ void handleApiStats() {
 void handleNotFound() {
   String clientIP = getClientIPString();
   logInfo("Not found: " + server.uri() + " from IP: " + clientIP);
-  
-  if(isWhitelisted(clientIP)) {
+
+  // If IP has an active session, or MAC is granted, do not force captive portal
+  bool allowed = isWhitelisted(clientIP);
+  if (!allowed) {
+    String mac = getClientMacByIP(clientIP);
+    if (mac.length()) allowed = isMacGranted(mac);
+  }
+
+  if (allowed) {
     server.send(200, "text/plain", "Connected - You have internet access.");
     return;
   }
-  
+
   // Non-whitelisted users get redirected to captive portal
   String redirectUrl = "http://" + WiFi.softAPIP().toString();
   server.sendHeader("Location", redirectUrl, true);
@@ -2279,21 +2336,11 @@ bool dnsActive = true; // track if DNS is currently running
 void grantClient(const String &macStr) {
   uint64_t now = millis();
   if (macStr.length() == 0) {
-    if (dnsActive) {
-      dnsServer.stop();
-      dnsActive = false;
-    }
-  } else {
-    grantedClients[macStr] = { now + GRANT_DURATION_MS };
+    Serial.println("[WARN] grantClient called with empty MAC; skipping.");
+    return;
   }
-
-  // Stop DNS temporarily so clients can resolve real domains
-  if (dnsActive) {
-    dnsServer.stop();
-    dnsActive = false;
-  }
-
-  Serial.println("[INFO] Client granted access & DNS stopped temporarily.");
+  grantedClients[macStr] = { now + GRANT_DURATION_MS };
+  Serial.println("[INFO] Client granted access: " + macStr);
 }
 
 // ---- Maintain grants (call in loop()) ----
@@ -2308,8 +2355,13 @@ void maintainGrants() {
   }
   for (auto &k : toRemove) grantedClients.erase(k);
 
-  if (!anyValid && !dnsActive) {
-    // Restart DNS if no active grants (optional)
+  // Toggle DNS captive redirection depending on whether any clients are granted
+  if (anyValid && dnsActive) {
+    dnsServer.stop();
+    dnsActive = false;
+    Serial.println("[INFO] DNS server stopped (active grants present). Real DNS flows for clients.");
+  } else if (!anyValid && !dnsActive) {
+    // Restart DNS if no active grants
     dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
     dnsActive = true;
     Serial.println("[INFO] DNS server restarted (no active grants).");
@@ -2327,23 +2379,59 @@ bool isMacGranted(const String &mac) {
 void setupCaptiveHandlers() {
   // Android captive-portal check
   server.on("/generate_204", [](){
-    server.send(204, "text/plain", "");
+    // If the client is allowed, respond 204 so the OS closes the captive UI
+    String ip = getClientIPString();
+    bool allowed = isWhitelisted(ip);
+    if (!allowed) {
+      String mac = getClientMacByIP(ip);
+      if (mac.length()) allowed = isMacGranted(mac);
+    }
+    if (allowed) server.send(204, "text/plain", "");
+    else server.send(200, "text/html", WELCOME_HTML);
   });
   // Android 6+ connectivity check
   server.on("/connecttest.txt", [](){
-    server.send(200, "text/plain", "OK");
+    String ip = getClientIPString();
+    bool allowed = isWhitelisted(ip);
+    if (!allowed) {
+      String mac = getClientMacByIP(ip);
+      if (mac.length()) allowed = isMacGranted(mac);
+    }
+    if (allowed) server.send(200, "text/plain", "OK");
+    else server.send(200, "text/html", WELCOME_HTML);
   });
   // iOS / macOS captive-portal check
   server.on("/hotspot-detect.html", [](){
-    server.send(200, "text/html", "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>");
+    String ip = getClientIPString();
+    bool allowed = isWhitelisted(ip);
+    if (!allowed) {
+      String mac = getClientMacByIP(ip);
+      if (mac.length()) allowed = isMacGranted(mac);
+    }
+    if (allowed) server.send(200, "text/html", "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>");
+    else server.send(200, "text/html", WELCOME_HTML);
   });
   // Windows NCSI
   server.on("/ncsi.txt", [](){
-    server.send(200, "text/plain", "Microsoft NCSI");
+    String ip = getClientIPString();
+    bool allowed = isWhitelisted(ip);
+    if (!allowed) {
+      String mac = getClientMacByIP(ip);
+      if (mac.length()) allowed = isMacGranted(mac);
+    }
+    if (allowed) server.send(200, "text/plain", "Microsoft NCSI");
+    else server.send(200, "text/html", WELCOME_HTML);
   });
   // Misc success endpoint
   server.on("/success.txt", [](){
-    server.send(200, "text/plain", "Success");
+    String ip = getClientIPString();
+    bool allowed = isWhitelisted(ip);
+    if (!allowed) {
+      String mac = getClientMacByIP(ip);
+      if (mac.length()) allowed = isMacGranted(mac);
+    }
+    if (allowed) server.send(200, "text/plain", "Success");
+    else server.send(200, "text/html", WELCOME_HTML);
   });
 
   Serial.println("[INFO] Captive portal detection handlers set up.");
@@ -2352,11 +2440,23 @@ void setupCaptiveHandlers() {
 // ---- Unlock & redirect client after reward ----
 void unlockClientAndRedirect(const String &ipStr, const String &macStr) {
   grantClient(macStr);
-
-  delay(150); // small pause before redirect
-  server.sendHeader("Location", "http://connectivitycheck.gstatic.com/generate_204");
+  // Prefer OS-specific success URL to close captive portal cleanly
+  delay(150);
+  String userAgent = server.header("User-Agent");
+  userAgent.toLowerCase();
+  String target;
+  if (userAgent.indexOf("android") != -1) {
+    target = "http://connectivitycheck.gstatic.com/generate_204";
+  } else if (userAgent.indexOf("iphone") != -1 || userAgent.indexOf("ipad") != -1 || userAgent.indexOf("mac") != -1) {
+    target = "http://captive.apple.com/hotspot-detect.html";
+  } else if (userAgent.indexOf("windows") != -1) {
+    target = "http://www.msftconnecttest.com/connecttest.txt";
+  } else {
+    target = "/userstatus"; // fallback
+  }
+  server.sendHeader("Location", target);
   server.send(302, "text/plain", "Redirecting...");
-  Serial.println("[INFO] Client redirected to connectivity check URL.");
+  Serial.println("[INFO] Client redirected to: " + target);
 }
 
 // ---- END FIXED PATCH ----
