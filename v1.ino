@@ -30,7 +30,7 @@
 // ESP-IDF headers to fetch station MAC/IP info while in softAP mode
 extern "C" {
   #include "esp_wifi.h"
-  #include "tcpip_adapter.h"
+  #include "esp_netif.h"
 }
 
 // ---------- CONFIG ----------
@@ -203,16 +203,16 @@ String getClientMacByIP(const String &ipStr) {
   }
 
   wifi_sta_list_t wifiStaList;
-  tcpip_adapter_sta_list_t adapterStaList;
+  esp_netif_sta_list_t netifStaList;
   if (esp_wifi_ap_get_sta_list(&wifiStaList) != ESP_OK) {
     return "";
   }
-  if (tcpip_adapter_get_sta_list(&wifiStaList, &adapterStaList) != ESP_OK) {
+  if (esp_netif_get_sta_list(&wifiStaList, &netifStaList) != ESP_OK) {
     return "";
   }
 
-  for (int i = 0; i < adapterStaList.num; i++) {
-    const auto &sta = adapterStaList.sta[i];
+  for (int i = 0; i < netifStaList.num; i++) {
+    const auto &sta = netifStaList.sta[i];
     IPAddress staIP(sta.ip.addr);
     if (staIP == targetIP) {
       char macBuf[18];
